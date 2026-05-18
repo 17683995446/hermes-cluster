@@ -89,6 +89,7 @@ class TestConcurrencyIssues:
         pool = await manager.create_pool(
             name="Terminate Pool",
             agent_type="worker",
+            min_size=0,
             initial_size=2
         )
         

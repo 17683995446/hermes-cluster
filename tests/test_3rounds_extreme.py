@@ -445,8 +445,8 @@ class TestRound3_DataIntegrityRecovery:
         n3 = await editor.add_node_async(wf.id, NodeType.CONDITION, "Condition", (400, 0))
 
         # 连接
-        editor.connect_nodes(wf.id, n1.id, "output", n2.id, "input")
-        editor.connect_nodes(wf.id, n2.id, "output", n3.id, "input")
+        editor.connect_nodes(wf.id, n1.id, n2.id, "output", "input")
+        editor.connect_nodes(wf.id, n2.id, n3.id, "output", "input")
 
         # 序列化
         d = wf.to_dict()

@@ -151,6 +151,7 @@ class AgentPoolManager:
         self._lock = asyncio.Lock()
     
     async def create_pool(self, name: str, agent_type: str, min_size: int = 1, max_size: int = 100, initial_size: int = 1) -> AgentPool:
+        initial_size = max(min_size, min(max_size, initial_size))
         pool = AgentPool(
             pool_id=str(uuid.uuid4()),
             name=name,
@@ -189,8 +190,21 @@ class AgentPoolManager:
                 await self._create_agent(pool)
             action = ScalingAction.SCALE_UP
         elif target_size < old_size:
-            agents_to_remove = list(pool.agents.keys())[:old_size - target_size]
-            for agent_id in agents_to_remove:
+            # 优先移除空闲agent
+            idle_agents = [a for a in pool.agents.values() if a.current_tasks == 0 and a.state == AgentState.IDLE]
+            busy_agents = [a for a in pool.agents.values() if a.current_tasks > 0 or a.state != AgentState.IDLE]
+            agents_to_remove = idle_agents[:old_size - target_size]
+            # 如果空闲agent不够，再从busy中选
+            if len(agents_to_remove) < old_size - target_size:
+                remaining = old_size - target_size - len(agents_to_remove)
+                # 当目标为0时（完全关闭），强制移除所有agent
+                if target_size == 0:
+                    agents_to_remove.extend(busy_agents[:remaining])
+                else:
+                    # 否则标记为DRAINING，不直接移除
+                    for agent in busy_agents[:remaining]:
+                        agent.state = AgentState.DRAINING
+            for agent_id in [a.agent_id for a in agents_to_remove]:
                 await self._terminate_agent(pool, agent_id)
             action = ScalingAction.SCALE_DOWN
         else:

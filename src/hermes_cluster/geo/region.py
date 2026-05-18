@@ -207,56 +207,69 @@ class DataSyncEngine:
         self._sync_queue: asyncio.Queue = asyncio.Queue()
         self._sync_tasks: Dict[str, SyncTask] = {}
         self._is_running = False
+        self._lock = asyncio.Lock()
     
     async def create_partition(self, partition_id: str, primary_region: str, replica_regions: List[str], sync_mode: SyncMode = SyncMode.ASYNC) -> DataPartition:
-        partition = DataPartition(
-            partition_id=partition_id,
-            region_id=primary_region,
-            replica_regions=replica_regions,
-            sync_mode=sync_mode
-        )
-        self._partitions[partition_id] = partition
-        return partition
+        async with self._lock:
+            partition = DataPartition(
+                partition_id=partition_id,
+                region_id=primary_region,
+                replica_regions=replica_regions,
+                sync_mode=sync_mode
+            )
+            self._partitions[partition_id] = partition
+            return partition
     
     async def sync_data(self, partition_id: str, data: Any, source_region: str) -> str:
-        partition = self._partitions.get(partition_id)
-        if not partition:
-            raise ValueError(f"分区不存在: {partition_id}")
-        
-        # 确定目标区域：优先同步到副本，避免回环
-        target_region = None
-        if source_region == partition.region_id:
-            # 从主区域发起，同步到第一个副本
-            if partition.replica_regions:
-                target_region = partition.replica_regions[0]
-        else:
-            # 从副本发起，同步回主区域
-            target_region = partition.region_id
-        
-        # 无副本且从主区域发起时，跳过同步
-        if target_region is None or target_region == source_region:
-            # 无需同步（无副本或已在目标区域）
+        async with self._lock:
+            partition = self._partitions.get(partition_id)
+            if not partition:
+                raise ValueError(f"分区不存在: {partition_id}")
+
+            # 确定目标区域：优先同步到副本，避免回环
+            target_region = None
+            if source_region == partition.region_id:
+                # 从主区域发起，同步到第一个副本
+                if partition.replica_regions:
+                    target_region = partition.replica_regions[0]
+            else:
+                # 从副本发起，同步回主区域
+                target_region = partition.region_id
+
+            # 无副本且从主区域发起时，跳过同步
+            if target_region is None or target_region == source_region:
+                # 无需同步（无副本或已在目标区域）
+                task = SyncTask(
+                    task_id=str(uuid.uuid4()),
+                    source_region=source_region,
+                    target_region=source_region,
+                    partition_id=partition_id,
+                    data=data,
+                    status="skipped"
+                )
+                self._sync_tasks[task.task_id] = task
+                # 限制保留最近1000条
+                if len(self._sync_tasks) > 1000:
+                    keys = list(self._sync_tasks.keys())
+                    for k in keys[:len(self._sync_tasks) - 800]:
+                        del self._sync_tasks[k]
+                return task.task_id
+
             task = SyncTask(
                 task_id=str(uuid.uuid4()),
                 source_region=source_region,
-                target_region=source_region,
+                target_region=target_region,
                 partition_id=partition_id,
-                data=data,
-                status="skipped"
+                data=data
             )
             self._sync_tasks[task.task_id] = task
+            # 限制保留最近1000条
+            if len(self._sync_tasks) > 1000:
+                keys = list(self._sync_tasks.keys())
+                for k in keys[:len(self._sync_tasks) - 800]:
+                    del self._sync_tasks[k]
+            await self._sync_queue.put(task)
             return task.task_id
-        
-        task = SyncTask(
-            task_id=str(uuid.uuid4()),
-            source_region=source_region,
-            target_region=target_region,
-            partition_id=partition_id,
-            data=data
-        )
-        self._sync_tasks[task.task_id] = task
-        await self._sync_queue.put(task)
-        return task.task_id
 
 
 class FailoverManager:

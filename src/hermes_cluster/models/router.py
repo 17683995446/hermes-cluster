@@ -22,7 +22,7 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional, Callable, AsyncIterator
@@ -467,10 +467,10 @@ class ModelRouter:
             raise RuntimeError("无可用模型")
 
         provider = self._providers[model_info.provider_id]
-        request.model = model_info.model_id
+        target_request = replace(request, model=model_info.model_id)
 
         try:
-            response = await provider.chat_completion(request)
+            response = await provider.chat_completion(target_request)
             self._record_usage(response)
             self._record_latency(model_info.model_id, response.latency_ms)
             return response
@@ -483,8 +483,8 @@ class ModelRouter:
             if fallback:
                 logger.info(f"故障转移到模型 {fallback.model_id}")
                 fallback_provider = self._providers[fallback.provider_id]
-                request.model = fallback.model_id
-                response = await fallback_provider.chat_completion(request)
+                fallback_request = replace(request, model=fallback.model_id)
+                response = await fallback_provider.chat_completion(fallback_request)
                 self._record_usage(response)
                 self._record_latency(fallback.model_id, response.latency_ms)
                 return response
@@ -497,8 +497,8 @@ class ModelRouter:
             raise RuntimeError("无可用模型")
 
         provider = self._providers[model_info.provider_id]
-        request.model = model_info.model_id
-        async for chunk in provider.chat_completion_stream(request):
+        target_request = replace(request, model=model_info.model_id)
+        async for chunk in provider.chat_completion_stream(target_request):
             yield chunk
 
     def _record_usage(self, response: ChatResponse) -> None:
@@ -512,6 +512,9 @@ class ModelRouter:
             request_id=response.request_id
         )
         self._usage_history.append(record)
+        # 保留最近1000条
+        if len(self._usage_history) > 1000:
+            self._usage_history = self._usage_history[-1000:]
 
     def _record_latency(self, model_id: str, latency_ms: float) -> None:
         if model_id not in self._latency_history:
@@ -523,6 +526,12 @@ class ModelRouter:
 
     def _record_error(self, model_id: str) -> None:
         self._error_counts[model_id] = self._error_counts.get(model_id, 0) + 1
+        # 限制条目数
+        if len(self._error_counts) > 100:
+            # 清理错误次数最少的条目
+            sorted_items = sorted(self._error_counts.items(), key=lambda x: x[1])
+            for k, _ in sorted_items[:len(self._error_counts) - 50]:
+                del self._error_counts[k]
 
     def get_usage_stats(self) -> Dict[str, Any]:
         total_tokens = sum(r.total_tokens for r in self._usage_history)

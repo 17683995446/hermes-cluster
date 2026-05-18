@@ -457,8 +457,8 @@ class TestLowCode:
         connection = editor.connect_nodes(
             workflow.id,
             node1.id,
-            "output",
             node2.id,
+            "output",
             "input"
         )
         assert connection is not None

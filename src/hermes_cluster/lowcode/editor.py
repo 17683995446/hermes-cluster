@@ -349,6 +349,11 @@ class WorkflowEditor:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
             return None
+        # 验证节点存在
+        if source_node_id not in workflow.nodes:
+            return None
+        if target_node_id not in workflow.nodes:
+            return None
 
         connection = Connection(
             id=str(uuid.uuid4()),
@@ -396,6 +401,16 @@ class WorkflowExecutor:
             )
 
         execution_id = str(uuid.uuid4())
+        # 在构建执行顺序之前添加验证
+        errors = workflow.validate()
+        if errors:
+            return WorkflowExecutionResult(
+                execution_id=execution_id,
+                workflow_id=workflow_id,
+                status=NodeStatus.FAILED,
+                error=f"工作流验证失败: {'; '.join(errors)}"
+            )
+
         result = WorkflowExecutionResult(
             execution_id=execution_id,
             workflow_id=workflow_id,
@@ -405,6 +420,11 @@ class WorkflowExecutor:
 
         async with self._lock:
             self._execution_results[execution_id] = result
+            # 限制保留最近500条
+            if len(self._execution_results) > 500:
+                keys = list(self._execution_results.keys())
+                for k in keys[:len(self._execution_results) - 300]:
+                    del self._execution_results[k]
 
         try:
             # 构建执行图
