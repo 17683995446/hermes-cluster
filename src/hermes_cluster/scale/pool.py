@@ -178,48 +178,49 @@ class AgentPoolManager:
         return agent
     
     async def scale_pool(self, pool_id: str, target_size: int) -> ScalingEvent:
-        pool = self._pools.get(pool_id)
-        if not pool:
-            raise ValueError(f"池不存在: {pool_id}")
-        
-        target_size = max(pool.min_size, min(pool.max_size, target_size))
-        old_size = pool.current_size
-        
-        if target_size > old_size:
-            for _ in range(target_size - old_size):
-                await self._create_agent(pool)
-            action = ScalingAction.SCALE_UP
-        elif target_size < old_size:
-            # 优先移除空闲agent
-            idle_agents = [a for a in pool.agents.values() if a.current_tasks == 0 and a.state == AgentState.IDLE]
-            busy_agents = [a for a in pool.agents.values() if a.current_tasks > 0 or a.state != AgentState.IDLE]
-            agents_to_remove = idle_agents[:old_size - target_size]
-            # 如果空闲agent不够，再从busy中选
-            if len(agents_to_remove) < old_size - target_size:
-                remaining = old_size - target_size - len(agents_to_remove)
-                # 当目标为0时（完全关闭），强制移除所有agent
-                if target_size == 0:
-                    agents_to_remove.extend(busy_agents[:remaining])
-                else:
-                    # 否则标记为DRAINING，不直接移除
-                    for agent in busy_agents[:remaining]:
-                        agent.state = AgentState.DRAINING
-            for agent_id in [a.agent_id for a in agents_to_remove]:
-                await self._terminate_agent(pool, agent_id)
-            action = ScalingAction.SCALE_DOWN
-        else:
-            action = ScalingAction.NONE
-        
-        pool.target_size = target_size
-        
-        return ScalingEvent(
-            event_id=str(uuid.uuid4()),
-            pool_id=pool_id,
-            action=action,
-            reason=f"Scaling to {target_size}",
-            old_size=old_size,
-            new_size=pool.current_size
-        )
+        async with self._lock:
+            pool = self._pools.get(pool_id)
+            if not pool:
+                raise ValueError(f"池不存在: {pool_id}")
+            
+            target_size = max(pool.min_size, min(pool.max_size, target_size))
+            old_size = pool.current_size
+            
+            if target_size > old_size:
+                for _ in range(target_size - old_size):
+                    await self._create_agent(pool)
+                action = ScalingAction.SCALE_UP
+            elif target_size < old_size:
+                # 优先移除空闲agent
+                idle_agents = [a for a in pool.agents.values() if a.current_tasks == 0 and a.state == AgentState.IDLE]
+                busy_agents = [a for a in pool.agents.values() if a.current_tasks > 0 or a.state != AgentState.IDLE]
+                agents_to_remove = idle_agents[:old_size - target_size]
+                # 如果空闲agent不够，再从busy中选
+                if len(agents_to_remove) < old_size - target_size:
+                    remaining = old_size - target_size - len(agents_to_remove)
+                    # 当目标为0时（完全关闭），强制移除所有agent
+                    if target_size == 0:
+                        agents_to_remove.extend(busy_agents[:remaining])
+                    else:
+                        # 否则标记为DRAINING，不直接移除
+                        for agent in busy_agents[:remaining]:
+                            agent.state = AgentState.DRAINING
+                for agent_id in [a.agent_id for a in agents_to_remove]:
+                    await self._terminate_agent(pool, agent_id)
+                action = ScalingAction.SCALE_DOWN
+            else:
+                action = ScalingAction.NONE
+            
+            pool.target_size = target_size
+            
+            return ScalingEvent(
+                event_id=str(uuid.uuid4()),
+                pool_id=pool_id,
+                action=action,
+                reason=f"Scaling to {target_size}",
+                old_size=old_size,
+                new_size=pool.current_size
+            )
     
     async def _terminate_agent(self, pool: AgentPool, agent_id: str) -> bool:
         agent = pool.agents.get(agent_id)
@@ -323,9 +324,11 @@ class PerformanceBenchmark:
             task_start = time.time()
             agent = await self._pool_manager.acquire_agent(pool_id)
             if agent:
-                await asyncio.sleep(0.001)
-                await self._pool_manager.release_agent(agent.agent_id)
-                completed += 1
+                try:
+                    await asyncio.sleep(0.001)
+                    completed += 1
+                finally:
+                    await self._pool_manager.release_agent(agent.agent_id)
             else:
                 failed += 1
             latencies.append((time.time() - task_start) * 1000)

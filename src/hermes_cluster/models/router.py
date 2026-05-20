@@ -220,6 +220,9 @@ class SiliconFlowProvider(ModelProvider):
 
                             data = await resp.json()
 
+                    if not data.get("choices"):
+                        raise RuntimeError("API返回空choices数组，可能触发了内容过滤")
+
                     latency = (time.time() - start_time) * 1000
                     choice = data["choices"][0]
                     message = choice["message"]
@@ -255,7 +258,8 @@ class SiliconFlowProvider(ModelProvider):
             raise RuntimeError(f"硅基流动请求失败，已重试 {self._config.max_retries} 次")
 
     async def chat_completion_stream(self, request: ChatRequest) -> AsyncIterator[str]:
-        async with self._semaphore:
+        await self._semaphore.acquire()
+        try:
             import aiohttp
 
             url = f"{self._config.base_url.rstrip('/')}/chat/completions"
@@ -276,17 +280,24 @@ class SiliconFlowProvider(ModelProvider):
                     url, headers=headers, json=payload,
                     timeout=aiohttp.ClientTimeout(total=self._config.timeout * 2)
                 ) as resp:
-                    async for line in resp.content:
-                        line = line.decode("utf-8").strip()
-                        if line.startswith("data: ") and line != "data: [DONE]":
-                            try:
-                                data = json.loads(line[6:])
-                                delta = data["choices"][0].get("delta", {})
-                                content = delta.get("content", "")
-                                if content:
-                                    yield content
-                            except (json.JSONDecodeError, KeyError, IndexError):
-                                continue
+                    buffer = ""
+                    async for chunk in resp.content:
+                        chunk_text = chunk.decode("utf-8")
+                        buffer += chunk_text
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            line = line.strip()
+                            if line.startswith("data: ") and line != "data: [DONE]":
+                                try:
+                                    data = json.loads(line[6:])
+                                    delta = data["choices"][0].get("delta", {})
+                                    content = delta.get("content", "")
+                                    if content:
+                                        yield content
+                                except (json.JSONDecodeError, KeyError, IndexError):
+                                    continue
+        finally:
+            self._semaphore.release()
 
 
 class OpenAICompatibleProvider(ModelProvider):
@@ -298,7 +309,6 @@ class OpenAICompatibleProvider(ModelProvider):
     async def chat_completion(self, request: ChatRequest) -> ChatResponse:
         async with self._semaphore:
             import aiohttp
-
             url = f"{self._config.base_url.rstrip('/')}/chat/completions"
             headers = {
                 "Authorization": f"Bearer {self._config.api_key}",
@@ -314,36 +324,62 @@ class OpenAICompatibleProvider(ModelProvider):
             if request.tools:
                 payload["tools"] = request.tools
 
-            start_time = time.time()
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url, headers=headers, json=payload,
-                    timeout=aiohttp.ClientTimeout(total=self._config.timeout)
-                ) as resp:
-                    if resp.status != 200:
-                        error_text = await resp.text()
-                        raise RuntimeError(f"API错误 {resp.status}: {error_text}")
-                    data = await resp.json()
+            last_error = None
+            for attempt in range(self._config.max_retries):
+                try:
+                    start_time = time.time()
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            url, headers=headers, json=payload,
+                            timeout=aiohttp.ClientTimeout(total=self._config.timeout)
+                        ) as resp:
+                            if resp.status == 429:
+                                retry_after = self._config.retry_delay
+                                try:
+                                    retry_after = float(resp.headers.get("Retry-After", retry_after))
+                                except (ValueError, TypeError):
+                                    pass
+                                await asyncio.sleep(retry_after * (attempt + 1))
+                                continue
+                            if resp.status != 200:
+                                error_text = await resp.text()
+                                raise RuntimeError(f"API错误 {resp.status}: {error_text}")
+                            data = await resp.json()
 
-            latency = (time.time() - start_time) * 1000
-            choice = data["choices"][0]
-            message = choice["message"]
-            usage = data.get("usage", {})
+                    latency = (time.time() - start_time) * 1000
 
-            return ChatResponse(
-                request_id=request.request_id,
-                model=data.get("model", request.model),
-                provider_id=self.provider_id,
-                content=message.get("content", ""),
-                finish_reason=choice.get("finish_reason", "stop"),
-                usage={
-                    "prompt_tokens": usage.get("prompt_tokens", 0),
-                    "completion_tokens": usage.get("completion_tokens", 0),
-                    "total_tokens": usage.get("total_tokens", 0)
-                },
-                tool_calls=message.get("tool_calls"),
-                latency_ms=latency
-            )
+                    # 检查空choices
+                    if not data.get("choices"):
+                        raise RuntimeError("API返回空choices数组")
+
+                    choice = data["choices"][0]
+                    message = choice["message"]
+                    usage = data.get("usage", {})
+
+                    return ChatResponse(
+                        request_id=request.request_id,
+                        model=data.get("model", request.model),
+                        provider_id=self.provider_id,
+                        content=message.get("content", ""),
+                        finish_reason=choice.get("finish_reason", "stop"),
+                        usage={
+                            "prompt_tokens": usage.get("prompt_tokens", 0),
+                            "completion_tokens": usage.get("completion_tokens", 0),
+                            "total_tokens": usage.get("total_tokens", 0)
+                        },
+                        tool_calls=message.get("tool_calls"),
+                        latency_ms=latency
+                    )
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    last_error = e
+                    if attempt < self._config.max_retries - 1:
+                        await asyncio.sleep(self._config.retry_delay * (attempt + 1))
+                    else:
+                        raise
+                except RuntimeError:
+                    raise
+
+            raise RuntimeError(f"请求失败，已重试 {self._config.max_retries} 次: {last_error}")
 
     async def chat_completion_stream(self, request: ChatRequest) -> AsyncIterator[str]:
         raise NotImplementedError("流式响应暂未实现")

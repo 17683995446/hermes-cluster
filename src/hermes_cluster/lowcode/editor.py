@@ -430,10 +430,21 @@ class WorkflowExecutor:
             # 构建执行图
             execution_order = self._build_execution_order(workflow)
 
-            # 按顺序执行节点
+            # 构建连接图：parent -> [(child_id, source_port), ...]
+            children_map: Dict[str, List[Tuple[str, str]]] = {}
+            for conn in workflow.connections.values():
+                children_map.setdefault(conn.source_node, []).append(
+                    (conn.target_node, conn.source_port)
+                )
+
+            # 跟踪哪些节点应该被执行
+            skip_set: Set[str] = set()
+
             for node_id in execution_order:
                 if result.status == NodeStatus.FAILED:
                     break
+                if node_id in skip_set:
+                    continue
 
                 node = workflow.nodes.get(node_id)
                 if not node:
@@ -447,9 +458,17 @@ class WorkflowExecutor:
                     result.error = node_result.error
                     break
                 elif node_result.status == NodeStatus.COMPLETED:
-                    # 更新上下文
                     if node_result.output is not None:
                         result.context[f"{node_id}_output"] = node_result.output
+
+                    # CONDITION节点：根据结果跳过不匹配的分支
+                    if node.type == NodeType.CONDITION and node_result.output:
+                        condition_result = node_result.output.get("condition_result", False)
+                        children = children_map.get(node_id, [])
+                        for child_id, port in children:
+                            if (condition_result and port != "true") or \
+                               (not condition_result and port != "false"):
+                                skip_set.add(child_id)
 
             if result.status != NodeStatus.FAILED:
                 result.status = NodeStatus.COMPLETED
@@ -505,29 +524,27 @@ class WorkflowExecutor:
 
         try:
             if node.type == NodeType.FUNCTION:
-                # 执行函数节点
                 code = node.config.get("code", "")
                 if code:
-                    # 创建安全的执行环境
-                    local_vars = {"context": context, "result": None}
-                    exec(code, {"__builtins__": {}}, local_vars)
-                    result.output = local_vars.get("result")
+                    async def _run_function():
+                        local_vars = {"context": context, "result": None}
+                        exec(code, {"__builtins__": {}}, local_vars)
+                        return local_vars.get("result")
+
+                    result.output = await asyncio.wait_for(_run_function(), timeout=timeout)
                 result.status = NodeStatus.COMPLETED
 
             elif node.type == NodeType.AGENT:
-                # 模拟Agent执行
-                await asyncio.sleep(0.001)  # 模拟延迟
+                await asyncio.wait_for(asyncio.sleep(0.001), timeout=timeout)
                 result.output = {"agent_result": f"Processed by {node.name}"}
                 result.status = NodeStatus.COMPLETED
 
             elif node.type == NodeType.TASK:
-                # 模拟任务执行
-                await asyncio.sleep(0.001)
+                await asyncio.wait_for(asyncio.sleep(0.001), timeout=timeout)
                 result.output = {"task_result": f"Task {node.name} completed"}
                 result.status = NodeStatus.COMPLETED
 
             elif node.type == NodeType.CONDITION:
-                # 条件节点
                 condition = node.config.get("condition", "True")
                 try:
                     local_vars = {"context": context}
@@ -539,13 +556,12 @@ class WorkflowExecutor:
                     result.status = NodeStatus.FAILED
 
             else:
-                # 其他类型节点
                 result.output = {"node_type": node.type.value}
                 result.status = NodeStatus.COMPLETED
 
         except asyncio.TimeoutError:
             result.status = NodeStatus.TIMEOUT
-            result.error = "执行超时"
+            result.error = f"节点执行超时 ({timeout}s)"
         except Exception as e:
             result.status = NodeStatus.FAILED
             result.error = str(e)
