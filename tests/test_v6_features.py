@@ -80,7 +80,7 @@ class TestGeoDeployment:
             endpoint="https://region1.hermes.io"
         )
         result = await manager.register_region(region)
-        assert result == True
+        assert result.region_id == "region-1"
         retrieved = await manager.get_region("region-1")
         assert retrieved is not None
         assert retrieved.name == "Region 1"
