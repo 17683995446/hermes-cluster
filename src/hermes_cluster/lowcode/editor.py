@@ -650,14 +650,16 @@ class WorkflowExecutor:
                 code = node.config.get("code", "")
                 if code:
                     logger.debug(f"BRANCH: condition=code provided, result=True")
-                    # 允许安全的内置函数
+                    # 严格限制可用的内置函数，禁用print和危险操作
                     safe_builtins = {
                         'len': len, 'range': range, 'enumerate': enumerate,
                         'zip': zip, 'map': map, 'filter': filter,
                         'sum': sum, 'min': min, 'max': max, 'abs': abs,
                         'int': int, 'float': float, 'str': str, 'list': list,
                         'dict': dict, 'set': set, 'tuple': tuple,
-                        'print': print, 'isinstance': isinstance, 'hasattr': hasattr
+                        'print': lambda *args, **kwargs: None,  # 禁用print输出
+                        'isinstance': isinstance, 'hasattr': hasattr,
+                        'type': type, 'dir': lambda obj: [],  # 限制dir返回空列表
                     }
                     async def _run_function():
                         local_vars = {"context": context, "result": None}
@@ -688,8 +690,18 @@ class WorkflowExecutor:
                 logger.debug(f"BRANCH: condition=node.type == CONDITION, result=True")
                 condition = node.config.get("condition", "True")
                 try:
+                    # 使用严格限制的安全环境评估条件
+                    safe_builtins = {
+                        'len': len, 'range': range, 'enumerate': enumerate,
+                        'zip': zip, 'map': map, 'filter': filter,
+                        'sum': sum, 'min': min, 'max': max, 'abs': abs,
+                        'int': int, 'float': float, 'str': str, 'list': list,
+                        'dict': dict, 'set': set, 'tuple': tuple,
+                        'isinstance': isinstance, 'hasattr': hasattr,
+                        'type': type, 'bool': bool,
+                    }
                     local_vars = {"context": context}
-                    condition_result = eval(condition, {"__builtins__": {}}, local_vars)
+                    condition_result = eval(condition, {"__builtins__": safe_builtins}, local_vars)
                     result.output = {"condition_result": bool(condition_result)}
                     result.status = NodeStatus.COMPLETED
                     logger.info(f"Condition node {node.id} evaluated: {condition_result}")

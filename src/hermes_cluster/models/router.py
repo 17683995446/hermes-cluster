@@ -306,26 +306,33 @@ class SiliconFlowProvider(ModelProvider):
                 ) as resp:
                     buffer = ""
                     chunk_count = 0
-                    async for chunk in resp.content:
-                        chunk_text = chunk.decode("utf-8")
-                        buffer += chunk_text
-                        while "\n" in buffer:
-                            line, buffer = buffer.split("\n", 1)
-                            line = line.strip()
-                            if line.startswith("data: ") and line != "data: [DONE]":
-                                try:
-                                    data = json.loads(line[6:])
-                                    delta = data["choices"][0].get("delta", {})
-                                    content = delta.get("content", "")
-                                    if content:
-                                        chunk_count += 1
-                                        yield content
-                                except (json.JSONDecodeError, KeyError, IndexError):
-                                    continue
+                    try:
+                        async for chunk in resp.content:
+                            chunk_text = chunk.decode("utf-8")
+                            buffer += chunk_text
+                            while "\n" in buffer:
+                                line, buffer = buffer.split("\n", 1)
+                                line = line.strip()
+                                if line.startswith("data: ") and line != "data: [DONE]":
+                                    try:
+                                        data = json.loads(line[6:])
+                                        delta = data["choices"][0].get("delta", {})
+                                        content = delta.get("content", "")
+                                        if content:
+                                            chunk_count += 1
+                                            yield content
+                                    except (json.JSONDecodeError, KeyError, IndexError):
+                                        continue
+                    finally:
+                        # 确保semaphore在yield过程中发生异常时也能释放
+                        self._semaphore.release()
+                        logger.debug(f"BRANCH: condition=semaphore released in finally, result=True")
                     logger.info(f"Stream completed: {request.request_id}, chunks={chunk_count}")
-        finally:
+        except Exception:
+            # 如果异常发生在acquire之后但在try块之前，或session创建失败
             self._semaphore.release()
-            logger.debug(f"BRANCH: condition=semaphore released, result=True")
+            logger.debug(f"BRANCH: condition=semaphore released on exception, result=True")
+            raise
 
 
 class OpenAICompatibleProvider(ModelProvider):
@@ -641,22 +648,53 @@ class ModelRouter:
             raise
 
     async def chat_stream(self, request: ChatRequest) -> AsyncIterator[str]:
-        """流式聊天"""
+        """流式聊天（带错误处理和故障转移）"""
         logger.debug(f"ENTER ModelRouter.chat_stream: args={{'request_id': request.request_id, 'model': request.model}}")
         model_info = await self.route(request.model)
         if not model_info:
             logger.error(f"No available model for stream request: {request.request_id}")
             raise RuntimeError("无可用模型")
 
-        provider = self._providers[model_info.provider_id]
+        provider = self._providers.get(model_info.provider_id)
+        if not provider or not provider.is_available:
+            # 故障转移到其他提供商
+            fallback = await self._fallback_route(model_info.model_id)
+            if fallback:
+                provider = self._providers.get(fallback.provider_id)
+                model_info = fallback
+                logger.info(f"Stream request fallback: {request.request_id} -> {model_info.model_id}")
+            else:
+                raise RuntimeError("无可用提供商")
+
         target_request = replace(request, model=model_info.model_id)
         logger.info(f"Stream request routed: {request.request_id} -> {model_info.model_id}")
-        chunk_count = 0
-        async for chunk in provider.chat_completion_stream(target_request):
-            chunk_count += 1
-            yield chunk
-        logger.info(f"Stream completed: {request.request_id}, chunks={chunk_count}")
-        logger.debug(f"EXIT ModelRouter.chat_stream: result=stream completed")
+
+        try:
+            chunk_count = 0
+            async for chunk in provider.chat_completion_stream(target_request):
+                chunk_count += 1
+                yield chunk
+            logger.info(f"Stream completed: {request.request_id}, chunks={chunk_count}")
+            logger.debug(f"EXIT ModelRouter.chat_stream: result=stream completed")
+        except Exception as e:
+            logger.error(f"EXCEPTION: {e}", exc_info=True)
+            logger.error(f"模型 {model_info.model_id} 流式请求失败: {e}")
+
+            # 尝试故障转移
+            fallback = await self._fallback_route(model_info.model_id)
+            if fallback:
+                logger.info(f"流式请求故障转移到模型 {fallback.model_id}")
+                fallback_provider = self._providers.get(fallback.provider_id)
+                if fallback_provider:
+                    fallback_request = replace(request, model=fallback.model_id)
+                    chunk_count = 0
+                    async for chunk in fallback_provider.chat_completion_stream(fallback_request):
+                        chunk_count += 1
+                        yield chunk
+                    logger.info(f"Fallback stream completed: {request.request_id} -> {fallback.model_id}, chunks={chunk_count}")
+                    logger.debug(f"EXIT ModelRouter.chat_stream: result=fallback stream completed")
+                    return
+            raise
 
     def _record_usage(self, response: ChatResponse) -> None:
         logger.debug(f"ENTER ModelRouter._record_usage: args={{'request_id': response.request_id, 'model': response.model}}")

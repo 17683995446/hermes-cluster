@@ -260,16 +260,25 @@ class AgentPoolManager:
             logger.warning(f"Agent not found for termination: {agent_id}")
             logger.debug(f"EXIT AgentPoolManager._terminate_agent: result=False")
             return False
+
         agent.state = AgentState.TERMINATING
         logger.info(f"Agent {agent_id} state changed to TERMINATING")
-        if agent_id in pool.agents:
-            del pool.agents[agent_id]
+
+        # 先从registry删除
         if agent_id in self._agent_registry:
             del self._agent_registry[agent_id]
-        pool.current_size -= 1
-        logger.info(f"Agent terminated: {agent_id}, pool {pool.pool_id} size now {pool.current_size}")
-        logger.debug(f"EXIT AgentPoolManager._terminate_agent: result=True")
-        return True
+
+        # 再从pool删除，成功后减size
+        if agent_id in pool.agents:
+            del pool.agents[agent_id]
+            pool.current_size -= 1
+            logger.info(f"Agent terminated: {agent_id}, pool {pool.pool_id} size now {pool.current_size}")
+            logger.debug(f"EXIT AgentPoolManager._terminate_agent: result=True")
+            return True
+
+        logger.warning(f"Agent {agent_id} not found in pool during termination")
+        logger.debug(f"EXIT AgentPoolManager._terminate_agent: result=False")
+        return False
     
     async def acquire_agent(self, pool_id: str, requirements: Optional[Dict[str, Any]] = None) -> Optional[AgentInstance]:
         logger.debug(f"ENTER AgentPoolManager.acquire_agent: args={{'pool_id': pool_id, 'requirements': requirements}}")
