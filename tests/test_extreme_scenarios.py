@@ -262,10 +262,10 @@ class TestScaleDownSafety:
             initial_size=5
         )
         
-        # 尝试缩容到0，应被限制为min_size
+        # 尝试缩容到0，BUG#55修复后允许完全关闭（target=0不受min_size限制）
         event = await manager.scale_pool(pool.pool_id, 0)
-        assert event.new_size >= pool.min_size, \
-            f"BUG: 缩容到0后new_size={event.new_size}低于min_size={pool.min_size}"
+        assert event.new_size == 0, \
+            f"BUG: 缩容到0后new_size={event.new_size}应为0"
     
     @pytest.mark.asyncio
     async def test_scale_up_beyond_max(self):

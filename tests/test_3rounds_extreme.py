@@ -114,8 +114,8 @@ class TestRound1_CrossModuleCascade:
         # current_size不应为负数
         assert pool.current_size >= 0, \
             f"BUG#1: current_size变为{pool.current_size}"
-        assert pool.current_size >= pool.min_size, \
-            f"BUG#1: current_size{pool.current_size} < min_size{pool.min_size}"
+        # BUG#55修复后：scale_pool(0)允许完全关闭，不再受min_size限制
+        # 并发场景下最终size可能是0或min_size，取决于执行顺序
 
     @pytest.mark.asyncio
     async def test_scale_kills_busy_agents(self):

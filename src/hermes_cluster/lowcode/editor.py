@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -356,6 +357,25 @@ class WorkflowEditor:
             logger.warning(f"Workflow not found for add_node: {workflow_id}")
             logger.debug(f"EXIT WorkflowEditor.add_node: result=False")
             return False
+        # BUG#58修复：sync add_node也添加默认端口
+        if not node.input_ports and not node.output_ports:
+            if node.type == NodeType.AGENT:
+                node.add_input_port("input", "any", True)
+                node.add_output_port("output", "any")
+            elif node.type == NodeType.TASK:
+                node.add_input_port("input", "any", True)
+                node.add_output_port("output", "any")
+            elif node.type == NodeType.CONDITION:
+                node.add_input_port("input", "any", True)
+                node.add_output_port("true", "any")
+                node.add_output_port("false", "any")
+            elif node.type == NodeType.PARALLEL:
+                node.add_input_port("input", "any", True)
+                node.add_output_port("output1", "any")
+                node.add_output_port("output2", "any")
+            elif node.type == NodeType.FUNCTION:
+                node.add_input_port("input", "any", True)
+                node.add_output_port("output", "any")
         workflow.add_node(node)
         logger.debug(f"EXIT WorkflowEditor.add_node: result=True")
         return True
@@ -464,6 +484,31 @@ class WorkflowEditor:
         logger.debug(f"EXIT WorkflowEditor.get_workflow: result={'found' if workflow else 'None'}")
         return workflow
 
+    # BUG#56修复：WorkflowEditor添加remove_node和remove_connection代理方法
+    def remove_node(self, workflow_id: str, node_id: str) -> bool:
+        """移除节点 (同步版本)"""
+        logger.debug(f"ENTER WorkflowEditor.remove_node: args={{'workflow_id': workflow_id, 'node_id': node_id}}")
+        workflow = self._workflows.get(workflow_id)
+        if not workflow:
+            logger.warning(f"Workflow not found for remove_node: {workflow_id}")
+            logger.debug(f"EXIT WorkflowEditor.remove_node: result=False")
+            return False
+        result = workflow.remove_node(node_id)
+        logger.debug(f"EXIT WorkflowEditor.remove_node: result={result}")
+        return result
+
+    def remove_connection(self, workflow_id: str, connection_id: str) -> bool:
+        """移除连接 (同步版本)"""
+        logger.debug(f"ENTER WorkflowEditor.remove_connection: args={{'workflow_id': workflow_id, 'connection_id': connection_id}}")
+        workflow = self._workflows.get(workflow_id)
+        if not workflow:
+            logger.warning(f"Workflow not found for remove_connection: {workflow_id}")
+            logger.debug(f"EXIT WorkflowEditor.remove_connection: result=False")
+            return False
+        result = workflow.remove_connection(connection_id)
+        logger.debug(f"EXIT WorkflowEditor.remove_connection: result={result}")
+        return result
+
 
 class WorkflowExecutor:
     """工作流执行器"""
@@ -492,9 +537,10 @@ class WorkflowExecutor:
             )
 
         execution_id = str(uuid.uuid4())
-        # 在构建执行顺序之前添加验证
+        # BUG#57修复：空工作流视为合法，直接返回COMPLETED
         errors = workflow.validate()
-        if errors:
+        if errors and len(workflow.nodes) > 0:
+            # 有节点但验证失败才报错
             logger.error(f"Workflow validation failed: {errors}")
             logger.debug(f"EXIT WorkflowExecutor.execute: result=error '工作流验证失败'")
             return WorkflowExecutionResult(
@@ -660,13 +706,26 @@ class WorkflowExecutor:
                         'print': lambda *args, **kwargs: None,  # 禁用print输出
                         'isinstance': isinstance, 'hasattr': hasattr,
                         'type': type, 'dir': lambda obj: [],  # 限制dir返回空列表
+                        # BUG#59修复：允许常见异常类和time模块（用户代码需要）
+                        'ValueError': ValueError, 'TypeError': TypeError,
+                        'KeyError': KeyError, 'IndexError': IndexError,
+                        'RuntimeError': RuntimeError, 'Exception': Exception,
+                        'AttributeError': AttributeError, 'StopIteration': StopIteration,
+                        'NotImplementedError': NotImplementedError,
+                        'True': True, 'False': False, 'None': None,
+                        'bool': bool, 'bytes': bytes,
                     }
-                    async def _run_function():
-                        local_vars = {"context": context, "result": None}
+                    # BUG#60修复：在executor中运行exec，防止阻塞事件循环导致timeout失效
+                    loop = asyncio.get_event_loop()
+                    def _run_sync():
+                        local_vars = {"context": context, "result": None, "time": time}
                         exec(code, {"__builtins__": safe_builtins}, local_vars)
                         return local_vars.get("result")
 
-                    result.output = await asyncio.wait_for(_run_function(), timeout=timeout)
+                    result.output = await asyncio.wait_for(
+                        loop.run_in_executor(None, _run_sync),
+                        timeout=timeout
+                    )
                     logger.info(f"Function node {node.id} executed successfully")
                 else:
                     logger.debug(f"BRANCH: condition=code provided, result=False")

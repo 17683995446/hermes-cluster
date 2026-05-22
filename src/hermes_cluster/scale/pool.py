@@ -197,34 +197,38 @@ class AgentPoolManager:
                 logger.error(f"Pool not found: {pool_id}")
                 return None  # 返回None而非抛出异常
             
-            target_size = max(pool.min_size, min(pool.max_size, target_size))
-            logger.debug(f"BRANCH: condition=target_size adjusted, result={target_size}")
+            # BUG#55修复：当target_size=0时允许完全关闭（不受min_size限制）
+            if target_size == 0:
+                effective_target = 0
+            else:
+                effective_target = max(pool.min_size, min(pool.max_size, target_size))
+            logger.debug(f"BRANCH: condition=target_size adjusted, result={effective_target}")
             old_size = pool.current_size
-            
-            if target_size > old_size:
-                logger.debug(f"BRANCH: condition=target_size > old_size, result=True (scale up)")
-                for i in range(target_size - old_size):
+
+            if effective_target > old_size:
+                logger.debug(f"BRANCH: condition=effective_target > old_size, result=True (scale up)")
+                for i in range(effective_target - old_size):
                     await self._create_agent(pool)
                 action = ScalingAction.SCALE_UP
                 logger.info(f"Pool {pool_id} scaled UP from {old_size} to {pool.current_size}")
-            elif target_size < old_size:
-                logger.debug(f"BRANCH: condition=target_size < old_size, result=True (scale down)")
+            elif effective_target < old_size:
+                logger.debug(f"BRANCH: condition=effective_target < old_size, result=True (scale down)")
                 # 优先移除空闲agent
                 idle_agents = [a for a in pool.agents.values() if a.current_tasks == 0 and a.state == AgentState.IDLE]
                 busy_agents = [a for a in pool.agents.values() if a.current_tasks > 0 or a.state != AgentState.IDLE]
                 logger.debug(f"BRANCH: condition=idle_agents count, result={len(idle_agents)}")
                 logger.debug(f"BRANCH: condition=busy_agents count, result={len(busy_agents)}")
-                agents_to_remove = idle_agents[:old_size - target_size]
+                agents_to_remove = idle_agents[:old_size - effective_target]
                 # 如果空闲agent不够，再从busy中选
-                if len(agents_to_remove) < old_size - target_size:
+                if len(agents_to_remove) < old_size - effective_target:
                     logger.debug(f"BRANCH: condition=need more agents to remove, result=True")
-                    remaining = old_size - target_size - len(agents_to_remove)
+                    remaining = old_size - effective_target - len(agents_to_remove)
                     # 当目标为0时（完全关闭），强制移除所有agent
-                    if target_size == 0:
-                        logger.debug(f"BRANCH: condition=target_size == 0, result=True (force remove all)")
+                    if effective_target == 0:
+                        logger.debug(f"BRANCH: condition=effective_target == 0, result=True (force remove all)")
                         agents_to_remove.extend(busy_agents[:remaining])
                     else:
-                        logger.debug(f"BRANCH: condition=target_size == 0, result=False (mark draining)")
+                        logger.debug(f"BRANCH: condition=effective_target == 0, result=False (mark draining)")
                         # 否则标记为DRAINING，不直接移除
                         for agent in busy_agents[:remaining]:
                             agent.state = AgentState.DRAINING
@@ -238,8 +242,8 @@ class AgentPoolManager:
             else:
                 logger.debug(f"BRANCH: condition=no scaling needed, result=True")
                 action = ScalingAction.NONE
-            
-            pool.target_size = target_size
+
+            pool.target_size = effective_target
             
             event = ScalingEvent(
                 event_id=str(uuid.uuid4()),
@@ -300,14 +304,11 @@ class AgentPoolManager:
             available.sort(key=lambda a: a.utilization)
             agent = available[0]
             agent.current_tasks += 1
-            logger.info(f"Agent {agent.agent_id} acquired, current_tasks={agent.current_tasks}")
-            # 检查是否达到上限，更新状态
-            if agent.current_tasks >= agent.spec.max_tasks:
-                logger.debug(f"BRANCH: condition=agent reached max_tasks, result=True")
+            # BUG#54修复：首次acquire即设为BUSY（只要有任务就表示忙碌）
+            if agent.state == AgentState.IDLE:
                 agent.state = AgentState.BUSY
                 logger.info(f"Agent {agent.agent_id} state changed to BUSY")
-            else:
-                logger.debug(f"BRANCH: condition=agent reached max_tasks, result=False")
+            logger.info(f"Agent {agent.agent_id} acquired, current_tasks={agent.current_tasks}")
             agent.last_active = datetime.now()
             logger.debug(f"EXIT AgentPoolManager.acquire_agent: result=agent {agent.agent_id}")
             return agent
