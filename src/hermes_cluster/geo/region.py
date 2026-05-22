@@ -75,7 +75,10 @@ class RegionInfo:
     
     @property
     def load_ratio(self) -> float:
-        return self.current_load / self.capacity if self.capacity > 0 else 0.0
+        # BUG#63修复：处理current_load为负数的情况
+        if self.capacity <= 0:
+            return 0.0
+        return max(0, self.current_load) / self.capacity
     
     @property
     def is_available(self) -> bool:

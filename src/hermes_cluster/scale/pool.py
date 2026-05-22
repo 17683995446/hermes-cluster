@@ -155,6 +155,11 @@ class AgentPoolManager:
     
     async def create_pool(self, name: str, agent_type: str, min_size: int = 1, max_size: int = 100, initial_size: int = 1) -> AgentPool:
         logger.debug(f"ENTER AgentPoolManager.create_pool: args={{'name': name, 'agent_type': agent_type, 'min_size': min_size, 'max_size': max_size, 'initial_size': initial_size}}")
+        # BUG#61修复：校验min_size <= max_size
+        if min_size > max_size:
+            logger.warning(f"Invalid pool config: min_size={min_size} > max_size={max_size}, auto-correcting")
+            min_size = max_size
+            logger.debug(f"BRANCH: condition=min_size corrected to max_size, result={min_size}")
         initial_size = max(min_size, min(max_size, initial_size))
         logger.debug(f"BRANCH: condition=initial_size adjusted, result={initial_size}")
         pool = AgentPool(
@@ -303,6 +308,18 @@ class AgentPoolManager:
             
             available.sort(key=lambda a: a.utilization)
             agent = available[0]
+            # BUG#62修复：再次检查current_tasks < max_tasks（防止并发竞态）
+            if agent.current_tasks >= agent.spec.max_tasks:
+                logger.warning(f"Agent {agent.agent_id} reached max_tasks, skipping")
+                # 尝试找另一个agent
+                for a in available[1:]:
+                    if a.current_tasks < a.spec.max_tasks:
+                        agent = a
+                        break
+                else:
+                    logger.warning(f"No agents with capacity in pool {pool_id}")
+                    logger.debug(f"EXIT AgentPoolManager.acquire_agent: result=None")
+                    return None
             agent.current_tasks += 1
             # BUG#54修复：首次acquire即设为BUSY（只要有任务就表示忙碌）
             if agent.state == AgentState.IDLE:
