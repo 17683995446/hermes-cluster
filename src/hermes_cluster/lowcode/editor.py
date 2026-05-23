@@ -610,6 +610,13 @@ class WorkflowExecutor:
                     result.error = node_result.error
                     logger.error(f"Workflow execution failed at node {node_id}: {node_result.error}")
                     break
+                # BUG#78修复：节点TIMEOUT也应中断工作流执行
+                elif node_result.status == NodeStatus.TIMEOUT:
+                    logger.debug(f"BRANCH: condition=node_result.status == TIMEOUT, result=True")
+                    result.status = NodeStatus.TIMEOUT
+                    result.error = node_result.error
+                    logger.error(f"Workflow execution timed out at node {node_id}: {node_result.error}")
+                    break
                 elif node_result.status == NodeStatus.COMPLETED:
                     logger.debug(f"BRANCH: condition=node_result.status == COMPLETED, result=True")
                     if node_result.output is not None:
@@ -629,7 +636,8 @@ class WorkflowExecutor:
                 else:
                     logger.debug(f"BRANCH: condition=node_result.status == {node_result.status.value}, result=True")
 
-            if result.status != NodeStatus.FAILED:
+            # BUG#78修复：只有非FAILED且非TIMEOUT时才标记为COMPLETED
+            if result.status not in (NodeStatus.FAILED, NodeStatus.TIMEOUT):
                 logger.debug(f"BRANCH: condition=workflow completed successfully, result=True")
                 result.status = NodeStatus.COMPLETED
                 logger.info(f"Workflow {workflow_id} completed successfully")
@@ -696,7 +704,7 @@ class WorkflowExecutor:
                 code = node.config.get("code", "")
                 if code:
                     logger.debug(f"BRANCH: condition=code provided, result=True")
-                    # 严格限制可用的内置函数，禁用print和危险操作
+                    # BUG#72修复：严格限制可用的内置函数，移除type/hasattr防止__class__逃逸
                     safe_builtins = {
                         'len': len, 'range': range, 'enumerate': enumerate,
                         'zip': zip, 'map': map, 'filter': filter,
@@ -704,8 +712,9 @@ class WorkflowExecutor:
                         'int': int, 'float': float, 'str': str, 'list': list,
                         'dict': dict, 'set': set, 'tuple': tuple,
                         'print': lambda *args, **kwargs: None,  # 禁用print输出
-                        'isinstance': isinstance, 'hasattr': hasattr,
-                        'type': type, 'dir': lambda obj: [],  # 限制dir返回空列表
+                        # BUG#72修复：移除type和hasattr，防止通过__class__.__bases__.__subclasses__()逃逸
+                        # BUG#72修复：移除isinstance（可被用于探测类型层次结构）
+                        'dir': lambda obj: [],  # 限制dir返回空列表
                         # BUG#59修复：允许常见异常类和time模块（用户代码需要）
                         'ValueError': ValueError, 'TypeError': TypeError,
                         'KeyError': KeyError, 'IndexError': IndexError,
@@ -715,17 +724,83 @@ class WorkflowExecutor:
                         'True': True, 'False': False, 'None': None,
                         'bool': bool, 'bytes': bytes,
                     }
-                    # BUG#60修复：在executor中运行exec，防止阻塞事件循环导致timeout失效
-                    loop = asyncio.get_event_loop()
-                    def _run_sync():
-                        local_vars = {"context": context, "result": None, "time": time}
-                        exec(code, {"__builtins__": safe_builtins}, local_vars)
-                        return local_vars.get("result")
+                    # BUG#77修复：使用multiprocessing实现真正的超时取消
+                    # 原方案run_in_executor(ThreadPool)无法取消线程中的无限循环
+                    import multiprocessing
+                    import pickle
 
-                    result.output = await asyncio.wait_for(
-                        loop.run_in_executor(None, _run_sync),
-                        timeout=timeout
+                    # 将context序列化为可传递的bytes
+                    try:
+                        context_bytes = pickle.dumps(context)
+                    except (TypeError, pickle.PicklingError):
+                        context_bytes = pickle.dumps(str(context))
+
+                    safe_builtins_names = list(safe_builtins.keys())
+
+                    def _run_in_process(code_str, ctx_bytes, builtin_names, result_queue):
+                        """在独立进程中执行用户代码，超时可通过terminate()真正取消"""
+                        import time as _time
+                        import pickle as _pickle
+                        ctx = _pickle.loads(ctx_bytes)
+                        _safe = {
+                            'len': len, 'range': range, 'enumerate': enumerate,
+                            'zip': zip, 'map': map, 'filter': filter,
+                            'sum': sum, 'min': min, 'max': max, 'abs': abs,
+                            'int': int, 'float': float, 'str': str, 'list': list,
+                            'dict': dict, 'set': set, 'tuple': tuple,
+                            'print': lambda *a, **k: None,
+                            'dir': lambda o: [],
+                            'ValueError': ValueError, 'TypeError': TypeError,
+                            'KeyError': KeyError, 'IndexError': IndexError,
+                            'RuntimeError': RuntimeError, 'Exception': Exception,
+                            'AttributeError': AttributeError, 'StopIteration': StopIteration,
+                            'NotImplementedError': NotImplementedError,
+                            'True': True, 'False': False, 'None': None,
+                            'bool': bool, 'bytes': bytes,
+                        }
+                        try:
+                            local_vars = {"context": ctx, "result": None, "time": _time}
+                            exec(code_str, {"__builtins__": _safe}, local_vars)
+                            output = local_vars.get("result")
+                            # BUG#80修复：返回修改后的context，支持用户代码直接修改context
+                            modified_ctx = local_vars.get("context", ctx)
+                            result_queue.put(("success", output, modified_ctx))
+                        except Exception as e:
+                            result_queue.put(("error", str(e)))
+
+                    # BUG#79修复：负数timeout应被clamp到默认值
+                    effective_timeout = max(1.0, timeout) if timeout > 0 else 300.0
+                    result_queue = multiprocessing.Queue()
+                    process = multiprocessing.Process(
+                        target=_run_in_process,
+                        args=(code, context_bytes, safe_builtins_names, result_queue),
+                        daemon=True
                     )
+                    process.start()
+                    process.join(timeout=effective_timeout)
+
+                    if process.is_alive():
+                        process.terminate()
+                        process.join(timeout=2)
+                        if process.is_alive():
+                            process.kill()
+                            process.join()
+                        logger.warning(f"BUG#77: Function node {node.id} timed out after {timeout}s, process terminated")
+                        raise asyncio.TimeoutError(f"节点执行超时 ({timeout}s)")
+
+                    if not result_queue.empty():
+                        msg = result_queue.get_nowait()
+                        if msg[0] == "success":
+                            _, output, modified_ctx = msg
+                            result.output = output
+                            # BUG#80修复：将子进程中修改的context合并回主进程context
+                            if isinstance(modified_ctx, dict):
+                                context.update(modified_ctx)
+                        else:
+                            raise RuntimeError(msg[1])
+                    else:
+                        raise RuntimeError("Process exited without producing result")
+
                     logger.info(f"Function node {node.id} executed successfully")
                 else:
                     logger.debug(f"BRANCH: condition=code provided, result=False")
@@ -749,15 +824,14 @@ class WorkflowExecutor:
                 logger.debug(f"BRANCH: condition=node.type == CONDITION, result=True")
                 condition = node.config.get("condition", "True")
                 try:
-                    # 使用严格限制的安全环境评估条件
+                    # BUG#72修复：使用严格限制的安全环境评估条件（移除type/hasattr/isinstance）
                     safe_builtins = {
                         'len': len, 'range': range, 'enumerate': enumerate,
                         'zip': zip, 'map': map, 'filter': filter,
                         'sum': sum, 'min': min, 'max': max, 'abs': abs,
                         'int': int, 'float': float, 'str': str, 'list': list,
                         'dict': dict, 'set': set, 'tuple': tuple,
-                        'isinstance': isinstance, 'hasattr': hasattr,
-                        'type': type, 'bool': bool,
+                        'bool': bool,
                     }
                     local_vars = {"context": context}
                     condition_result = eval(condition, {"__builtins__": safe_builtins}, local_vars)
