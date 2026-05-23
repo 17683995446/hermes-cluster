@@ -525,6 +525,9 @@ class WorkflowExecutor:
                       timeout: float = 300.0) -> WorkflowExecutionResult:
         """执行工作流"""
         logger.debug(f"ENTER WorkflowExecutor.execute: args={{'workflow_id': workflow_id, 'timeout': timeout}}")
+        # BUG#87修复：确保context不为None，避免后续节点执行时context.get()报错
+        if context is None:
+            context = {}
         workflow = self._editor.get_workflow(workflow_id)
         if not workflow:
             logger.error(f"Workflow not found for execution: {workflow_id}")
@@ -621,6 +624,8 @@ class WorkflowExecutor:
                     logger.debug(f"BRANCH: condition=node_result.status == COMPLETED, result=True")
                     if node_result.output is not None:
                         result.context[f"{node_id}_output"] = node_result.output
+                        # BUG#87修复：同步更新context参数，使后续节点能看到前序节点的输出
+                        context[f"{node_id}_output"] = node_result.output
                         logger.debug(f"BRANCH: condition=node_output stored, result=True")
 
                     # CONDITION节点：根据结果跳过不匹配的分支
@@ -730,10 +735,12 @@ class WorkflowExecutor:
                     import pickle
 
                     # 将context序列化为可传递的bytes
+                    # BUG#82修复：pickle失败时使用空dict而非str(context)，避免类型错误
                     try:
                         context_bytes = pickle.dumps(context)
-                    except (TypeError, pickle.PicklingError):
-                        context_bytes = pickle.dumps(str(context))
+                    except Exception:
+                        logger.warning(f"BUG#82: Context pickle failed, using empty dict fallback")
+                        context_bytes = pickle.dumps({})
 
                     safe_builtins_names = list(safe_builtins.keys())
 
@@ -784,7 +791,10 @@ class WorkflowExecutor:
                         process.join(timeout=2)
                         if process.is_alive():
                             process.kill()
-                            process.join()
+                            # BUG#83修复：kill后join添加超时，防止不可中断I/O导致永久阻塞
+                            process.join(timeout=3)
+                            if process.is_alive():
+                                logger.error(f"BUG#83: Process for node {node.id} could not be killed")
                         logger.warning(f"BUG#77: Function node {node.id} timed out after {timeout}s, process terminated")
                         raise asyncio.TimeoutError(f"节点执行超时 ({timeout}s)")
 
@@ -834,10 +844,19 @@ class WorkflowExecutor:
                         'bool': bool,
                     }
                     local_vars = {"context": context}
-                    condition_result = eval(condition, {"__builtins__": safe_builtins}, local_vars)
+                    # BUG#81修复：为CONDITION节点添加超时保护，防止恶意表达式阻塞事件循环
+                    loop = asyncio.get_event_loop()
+                    condition_result = await asyncio.wait_for(
+                        loop.run_in_executor(None, lambda: eval(condition, {"__builtins__": safe_builtins}, local_vars)),
+                        timeout=min(timeout, 10.0)  # CONDITION节点最多10秒
+                    )
                     result.output = {"condition_result": bool(condition_result)}
                     result.status = NodeStatus.COMPLETED
                     logger.info(f"Condition node {node.id} evaluated: {condition_result}")
+                except asyncio.TimeoutError:
+                    logger.error(f"BUG#81: Condition node {node.id} timed out")
+                    result.error = f"条件评估超时"
+                    result.status = NodeStatus.TIMEOUT
                 except Exception as e:
                     logger.error(f"EXCEPTION: {e}", exc_info=True)
                     result.error = f"条件评估错误: {e}"

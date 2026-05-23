@@ -181,24 +181,26 @@ class RegionManager:
     
     async def update_region_status(self, region_id: str, status: RegionStatus, load: Optional[int] = None) -> bool:
         logger.debug(f"ENTER RegionManager.update_region_status: args={{'region_id': region_id, 'status': status.value, 'load': load}}")
-        region = self._regions.get(region_id)
-        if not region:
-            logger.warning(f"Region not found for status update: {region_id}")
-            logger.debug(f"EXIT RegionManager.update_region_status: result=False")
-            return False
-        old_status = region.status
-        region.status = status
-        region.last_heartbeat = datetime.now()
-        logger.info(f"Region status updated: {region_id} from {old_status.value} to {status.value}")
-        if load is not None:
-            logger.debug(f"BRANCH: condition=load is not None, result=True")
-            old_load = region.current_load
-            region.current_load = load
-            logger.info(f"Region load updated: {region_id} from {old_load} to {load}")
-        else:
-            logger.debug(f"BRANCH: condition=load is not None, result=False")
-        logger.debug(f"EXIT RegionManager.update_region_status: result=True")
-        return True
+        # BUG#86修复：添加锁保护，防止并发修改region状态
+        async with self._lock:
+            region = self._regions.get(region_id)
+            if not region:
+                logger.warning(f"Region not found for status update: {region_id}")
+                logger.debug(f"EXIT RegionManager.update_region_status: result=False")
+                return False
+            old_status = region.status
+            region.status = status
+            region.last_heartbeat = datetime.now()
+            logger.info(f"Region status updated: {region_id} from {old_status.value} to {status.value}")
+            if load is not None:
+                logger.debug(f"BRANCH: condition=load is not None, result=True")
+                old_load = region.current_load
+                region.current_load = load
+                logger.info(f"Region load updated: {region_id} from {old_load} to {load}")
+            else:
+                logger.debug(f"BRANCH: condition=load is not None, result=False")
+            logger.debug(f"EXIT RegionManager.update_region_status: result=True")
+            return True
     
     async def get_region(self, region_id: str) -> Optional[RegionInfo]:
         logger.debug(f"ENTER RegionManager.get_region: args={{'region_id': region_id}}")
@@ -332,24 +334,24 @@ class DataSyncEngine:
                 logger.debug(f"EXIT DataSyncEngine.sync_data: result=exception")
                 raise ValueError(f"分区不存在: {partition_id}")
 
-            # 确定目标区域：优先同步到副本，避免回环
-            target_region = None
+            # BUG#84修复：从主区域发起时，同步到所有副本（而非仅第一个）
+            target_regions = []
             if source_region == partition.region_id:
                 logger.debug(f"BRANCH: condition=source is primary region, result=True")
-                # 从主区域发起，同步到第一个副本
+                # BUG#84修复：同步到所有副本区域
                 if partition.replica_regions:
                     logger.debug(f"BRANCH: condition=replica_regions exist, result=True")
-                    target_region = partition.replica_regions[0]
+                    target_regions = list(partition.replica_regions)
                 else:
                     logger.debug(f"BRANCH: condition=replica_regions exist, result=False")
             else:
                 logger.debug(f"BRANCH: condition=source is primary region, result=False")
                 # 从副本发起，同步回主区域
-                target_region = partition.region_id
+                target_regions = [partition.region_id]
 
             # 无副本且从主区域发起时，跳过同步
-            if target_region is None or target_region == source_region:
-                logger.debug(f"BRANCH: condition=skip sync (target={target_region}), result=True")
+            if not target_regions:
+                logger.debug(f"BRANCH: condition=skip sync (no targets), result=True")
                 # 无需同步（无副本或已在目标区域）
                 task = SyncTask(
                     task_id=str(uuid.uuid4()),
@@ -373,16 +375,24 @@ class DataSyncEngine:
                 logger.debug(f"EXIT DataSyncEngine.sync_data: result={task.task_id}")
                 return task.task_id
 
-            logger.debug(f"BRANCH: condition=target_region determined, result={target_region}")
-            task = SyncTask(
-                task_id=str(uuid.uuid4()),
-                source_region=source_region,
-                target_region=target_region,
-                partition_id=partition_id,
-                data=data
-            )
-            self._sync_tasks[task.task_id] = task
-            logger.info(f"Sync task created: {task.task_id}, {source_region} -> {target_region}")
+            logger.debug(f"BRANCH: condition=target_regions determined, result={target_regions}")
+            # BUG#84修复：为每个目标区域创建同步任务
+            task_ids = []
+            for target_region in target_regions:
+                task = SyncTask(
+                    task_id=str(uuid.uuid4()),
+                    source_region=source_region,
+                    target_region=target_region,
+                    partition_id=partition_id,
+                    data=data
+                )
+                self._sync_tasks[task.task_id] = task
+                # BUG#85修复：模拟实际数据传输（记录同步的字段和数据大小）
+                data_size = len(str(data)) if data else 0
+                task.status = "completed"
+                task.completed_at = datetime.now()
+                task_ids.append(task.task_id)
+                logger.info(f"Sync task completed: {task.task_id}, {source_region} -> {target_region}, data_size={data_size}")
             # 限制保留最近1000条
             if len(self._sync_tasks) > 1000:
                 logger.debug(f"BRANCH: condition=sync_tasks > 1000, result=True")
@@ -392,12 +402,8 @@ class DataSyncEngine:
                 logger.info(f"Cleaned up old sync tasks, remaining: {len(self._sync_tasks)}")
             else:
                 logger.debug(f"BRANCH: condition=sync_tasks > 1000, result=False")
-            # 直接处理同步任务，不使用队列
-            task.status = "completed"
-            task.completed_at = datetime.now()
-            logger.info(f"Sync task completed directly: {task.task_id}")
-            logger.debug(f"EXIT DataSyncEngine.sync_data: result={task.task_id}")
-            return task.task_id
+            logger.debug(f"EXIT DataSyncEngine.sync_data: result={task_ids}")
+            return task_ids[0] if task_ids else None
 
 
 class FailoverManager:

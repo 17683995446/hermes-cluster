@@ -283,6 +283,7 @@ class SiliconFlowProvider(ModelProvider):
         logger.debug(f"ENTER SiliconFlowProvider.chat_completion_stream: args={{'request_id': request.request_id, 'model': request.model}}")
         await self._semaphore.acquire()
         logger.debug(f"BRANCH: condition=semaphore acquired, result=True")
+        released = False
         try:
             import aiohttp
 
@@ -324,13 +325,17 @@ class SiliconFlowProvider(ModelProvider):
                                     except (json.JSONDecodeError, KeyError, IndexError):
                                         continue
                     finally:
-                        # 确保semaphore在yield过程中发生异常时也能释放
-                        self._semaphore.release()
+                        # BUG#35修复：使用released标志防止双重释放semaphore
+                        if not released:
+                            self._semaphore.release()
+                            released = True
                         logger.debug(f"BRANCH: condition=semaphore released in finally, result=True")
                     logger.info(f"Stream completed: {request.request_id}, chunks={chunk_count}")
         except Exception:
-            # 如果异常发生在acquire之后但在try块之前，或session创建失败
-            self._semaphore.release()
+            # BUG#35修复：使用released标志防止双重释放
+            if not released:
+                self._semaphore.release()
+                released = True
             logger.debug(f"BRANCH: condition=semaphore released on exception, result=True")
             raise
 
